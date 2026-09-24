@@ -1,0 +1,13 @@
+*.blend
+*.txt~
+/__pycache__
+/rprmaterials
+
+# Temporary Blender files.
+blendcache_*
+*.blend1
+*.blend2
+
+# Temporary OpenVSP files.
+*.vsptime
+*.bak
