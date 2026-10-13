@@ -22,6 +22,16 @@ home_dir = os.path.expanduser("~")
 image_cache = {}
 image_context_menu = None
 info_clear_job = None
+MANIFEST_FILETYPES = [
+    ("Changes Manifest", "changes.json"),
+    ("JSON Files", "*.json"),
+    ("All Files", "*.*"),
+]
+MANIFEST_ZENITY_FILTERS = [
+    "--file-filter=Changes Manifest (changes.json) | changes.json",
+    "--file-filter=JSON Files | *.json",
+    "--file-filter=All Files | *",
+]
 output_manifest = {}
 recent_menu = None
 search_state = {"in_images": False, "index": -1, "match_word": False, "query": "", "results": []}
@@ -50,6 +60,10 @@ def load_help_config(app_root, target_dir):
 
 def load_find_config(app_root, target_dir):
     source_tcl_script(app_root, target_dir, "find.tcl")
+
+
+def load_log_config(app_root, target_dir):
+    source_tcl_script(app_root, target_dir, "log.tcl")
 
 
 def get_image_height():
@@ -115,8 +129,8 @@ def populate_categories(target_dir=None):
         ])
 
     if cats:
-        category["values"] = cats
-        category.current(0)
+        category_combo["values"] = cats
+        category_combo.current(0)
         populate_materials(current_target_dir, cats[0])
 
 
@@ -866,7 +880,6 @@ def on_right_arrow(pair):
     if not src_path or not os.path.isfile(src_path):
         src_path = resolve_image_path(rel_path)
     if not src_path or not os.path.isfile(src_path):
-        write_to_log("Source image was not found on disk!")
         return
     stage_pair_image(pair, src_path)
 
@@ -928,28 +941,23 @@ def evict_image_cache(image_path):
 
 def open_with_image_viewer(filepath):
     if not filepath or not os.path.isfile(filepath):
-        write_to_log("Image file not found on disk!")
         return
     abs_path = os.path.abspath(filepath)
     try:
         subprocess.Popen(["xdg-open", abs_path])
-        write_to_log(f'Opened "{os.path.basename(abs_path)}" with image viewer.')
     except Exception as e:
         write_to_log(f"Error opening image viewer: {e}")
 
 
 def open_containing_folder(filepath):
     if not filepath:
-        write_to_log("Image path not found!")
         return
     abs_path = os.path.abspath(filepath)
     folder = os.path.dirname(abs_path)
     if not os.path.isdir(folder):
-        write_to_log("Containing folder not found on disk!")
         return
     try:
         subprocess.Popen(["xdg-open", folder])
-        write_to_log(f'Opened containing folder "{folder}".')
     except Exception as e:
         write_to_log(f"Error opening containing folder: {e}")
 
@@ -993,14 +1001,12 @@ def on_cut_image(pair, path):
         return
     set_clipboard_image_path(path)
     on_clear_pair(pair)
-    write_to_log(f'Cut "{os.path.basename(path)}".')
 
 
 def on_copy_image(path):
     if not path or not os.path.isfile(path):
         return
     set_clipboard_image_path(path)
-    write_to_log(f'Copied "{os.path.basename(path)}".')
 
 
 def on_paste_image(pair):
@@ -1009,13 +1015,11 @@ def on_paste_image(pair):
         return
     paste_path = get_clipboard_image_path()
     if not paste_path or not os.path.isfile(paste_path):
-        write_to_log("No valid image file found on clipboard!")
         return
 
     if not validate_pair_image_format(pair, paste_path):
         return
     stage_pair_image(pair, paste_path)
-    write_to_log(f'Pasted "{os.path.basename(paste_path)}".')
 
 
 def dismiss_context_menu():
@@ -1208,11 +1212,11 @@ def open_session(title="Open", target_path=None):
     write_to_log(f'Loaded session from "{manifest_path}".')
 
 
-def call_tk_command(cmd):
+def call_tk_command(cmd, *args):
     try:
-        root.tk.call(cmd)
+        return root.tk.call(cmd, *args)
     except Exception:
-        pass
+        return None
 
 
 def show_help(event=None):
@@ -1254,7 +1258,7 @@ def perform_find(query_str, match_word_flag, in_images_flag, direction_str):
             q_lower = query.lower()
             is_match = lambda s: q_lower in s.lower() if s else False
 
-        cats = list(category["values"])
+        cats = list(category_combo["values"])
         if not cats:
             manifests_dir = get_manifests_dir(current_target_dir)
             if os.path.isdir(manifests_dir):
@@ -1299,14 +1303,14 @@ def perform_find(query_str, match_word_flag, in_images_flag, direction_str):
             search_state["index"] = (search_state["index"] + direction) % len(results)
 
     if not search_state["results"]:
-        write_to_log(f'Phrase not found')
+        set_info('Phrase not found')
         return
 
     idx = search_state["index"]
     target_cat, target_mat = search_state["results"][idx]
 
     if category_var.get() != target_cat:
-        category.set(target_cat)
+        category_combo.set(target_cat)
         category_var.set(target_cat)
         populate_materials(current_target_dir, target_cat)
 
@@ -1319,19 +1323,7 @@ def perform_find(query_str, match_word_flag, in_images_flag, direction_str):
         material_list.see(mat_idx)
         on_material_select()
 
-    write_to_log(f'{idx + 1} of {len(results)} matches')
-
-
-MANIFEST_FILETYPES = [
-    ("Changes Manifest", "changes.json"),
-    ("JSON Files", "*.json"),
-    ("All Files", "*.*"),
-]
-MANIFEST_ZENITY_FILTERS = [
-    "--file-filter=Changes Manifest (changes.json) | changes.json",
-    "--file-filter=JSON Files | *.json",
-    "--file-filter=All Files | *",
-]
+    set_info(f'{idx + 1} of {len(results)} matches')
 
 
 def ask_manifest_dialog(title="Open"):
@@ -1429,9 +1421,9 @@ def run_blender_tasks(tasks, total_steps, on_complete=None):
         return
 
     total_count = max(1, total_steps)
-    progress["maximum"] = total_count
-    progress["value"] = 0
-    progress.grid()
+    progress_bar["maximum"] = total_count
+    progress_bar["value"] = 0
+    progress_bar.grid()
     operation_var.set(f"{tasks[0][0]} (0/{total_steps})...")
 
     worker_queue = queue.Queue()
@@ -1441,8 +1433,8 @@ def run_blender_tasks(tasks, total_steps, on_complete=None):
             while True:
                 msg = worker_queue.get_nowait()
                 if msg is None:
-                    progress["value"] = progress["maximum"]
-                    progress.grid_remove()
+                    progress_bar["value"] = progress_bar["maximum"]
+                    progress_bar.grid_remove()
                     operation_var.set("")
                     if on_complete:
                         on_complete()
@@ -1451,11 +1443,11 @@ def run_blender_tasks(tasks, total_steps, on_complete=None):
                 if action == "log":
                     append_log(payload)
                 elif action == "phase":
-                    progress["value"] = 0
+                    progress_bar["value"] = 0
                     operation_var.set(f"{payload} (0/{total_steps})...")
                 elif action == "step":
                     phase_label, val, name = payload
-                    progress["value"] = val
+                    progress_bar["value"] = val
                     operation_var.set(f"{phase_label} ({val}/{total_steps}): {name}")
         except queue.Empty:
             pass
@@ -1653,43 +1645,38 @@ def load_output_manifest(target=None):
 
 
 def append_log(text):
-    log_output.configure(state="normal")
-    if log_output.index("end-1c") != "1.0" and log_output.get("end-2c") != "\n":
-        log_output.insert(END, "\n")
-    log_output.insert(END, text)
-    log_output.see(END)
-    log_output.configure(state="disabled")
+    call_tk_command("append_log", text)
 
 
-def write_to_log(msg, info_msg=None):
+def set_info(msg):
     global info_clear_job
-    append_log(f"{str(msg)}\n")
-
     if not is_debug_mode():
         if info_clear_job is not None:
             try:
                 root.after_cancel(info_clear_job)
             except Exception:
                 pass
-        text = str(info_msg if info_msg is not None else msg)
+        text = str(msg)
         info_var.set(f"{text[:64]}..." if len(text) > 64 else text)
-        info.configure(style="Info.TLabel")
+        info_label.configure(style="Info.TLabel")
 
         def clear_info():
             global info_clear_job
             info_clear_job = None
             if not is_debug_mode():
                 info_var.set("")
-                info.configure(style="TLabel")
+                info_label.configure(style="TLabel")
 
         info_clear_job = root.after(5000, clear_info)
 
 
+def write_to_log(msg, info_msg=None):
+    append_log(f"{str(msg)}\n")
+    set_info(info_msg if info_msg is not None else msg)
+
+
 def toggle_log(event=None):
-    if log.grid_info():
-        log.grid_remove()
-    else:
-        log.grid()
+    call_tk_command("toggle_log")
 
 
 def save_log():
@@ -1701,16 +1688,15 @@ def save_log():
     )
     if path:
         try:
+            content = call_tk_command("get_log_text") or ""
             with open(path, "w", encoding="utf-8") as f:
-                f.write(log_output.get("1.0", "end-1c"))
+                f.write(content)
         except Exception:
             pass
 
 
 def clear_log():
-    log_output.configure(state="normal")
-    log_output.delete("1.0", END)
-    log_output.configure(state="disabled")
+    call_tk_command("clear_log")
 
 
 def is_debug_mode(app_root=None):
@@ -1729,10 +1715,9 @@ def load_debug_config(app_root, target_dir):
     is_debug = is_debug_mode(app_root)
 
     if is_debug:
-        if not log.grid_info():
-            log.grid()
+        call_tk_command("show_log")
         info_var.set("Debug")
-        info.configure(style="Debug.TLabel")
+        info_label.configure(style="Debug.TLabel")
 
     if is_debug:
         source_tcl_script(app_root, target_dir, "debug.tcl")
@@ -1745,8 +1730,7 @@ root.resizable(False, False)
 root.columnconfigure(0, weight=1)
 root.rowconfigure(0, weight=1)
 
-root.createcommand("toggle_log", toggle_log)
-root.createcommand("clear_log", clear_log)
+root.createcommand("save_log", save_log)
 root.createcommand("write_to_log", write_to_log)
 root.createcommand("open_help_url", webbrowser.open)
 root.createcommand("perform_find", perform_find)
@@ -1755,6 +1739,7 @@ load_tcl_config(root, base_dir)
 load_style_config(root, base_dir)
 load_help_config(root, base_dir)
 load_find_config(root, base_dir)
+load_log_config(root, base_dir)
 
 category_var = StringVar()
 images_in_material_var = StringVar(value="Images in material: 0")
@@ -1768,24 +1753,15 @@ mainframe.grid(column=0, row=0, sticky=(N, W, E, S))
 mainframe.columnconfigure(1, weight=1, uniform="preview_cols")
 mainframe.columnconfigure(2, weight=1, uniform="preview_cols")
 
-material = ttk.Labelframe(mainframe, text="Material")
-material.grid(column=0, row=1, rowspan=2, sticky=(N, S, E, W))
-material.rowconfigure(0, weight=1)
-material.columnconfigure(0, weight=1)
+material_frame = ttk.Labelframe(mainframe, text="Material")
+material_frame.grid(column=0, row=1, rowspan=2, sticky=(N, S, E, W))
+material_frame.rowconfigure(0, weight=1)
+material_frame.columnconfigure(0, weight=1)
 
 tool_strip = ttk.Frame(mainframe)
 tool_strip.grid(column=0, row=3, columnspan=4, sticky=(N, S, E, W))
 tool_strip.columnconfigure(1, weight=1)
 tool_strip.rowconfigure(0, weight=1)
-
-log = ttk.Labelframe(mainframe, text=" Log ")
-log.grid(column=0, row=4, columnspan=4, sticky=(N, S, E, W))
-log.columnconfigure(0, weight=1)
-log.rowconfigure(0, weight=1)
-log.grid_remove()
-
-log_tool_strip = ttk.Frame(log)
-log_tool_strip.grid(column=0, row=1, columnspan=2, sticky=(W, E))
 
 menubar = Menu(root)
 file_menu = Menu(menubar)
@@ -1811,16 +1787,16 @@ help_menu.add_command(label='Manual', accelerator='F1', command=show_help)
 root['menu'] = menubar
 update_recent_menu()
 
-category = ttk.Combobox(mainframe, textvariable=category_var)
-category.state(["readonly"])
-category.grid(column=0, row=0, sticky=(W, E))
+category_combo = ttk.Combobox(mainframe, textvariable=category_var)
+category_combo.state(["readonly"])
+category_combo.grid(column=0, row=0, sticky=(W, E))
 
 materials_in_category = ttk.Label(mainframe, textvariable=materials_in_category_var, anchor="w", relief="sunken")
 materials_in_category.grid(column=1, row=0, sticky=(W, E))
 images_in_material = ttk.Label(mainframe, textvariable=images_in_material_var, anchor="w", relief="sunken")
 images_in_material.grid(column=2, row=0, sticky=(W, E))
 
-material_list = Listbox(material, exportselection=False)
+material_list = Listbox(material_frame, exportselection=False)
 material_list.grid(column=0, row=0, sticky=(N, S, E, W))
 
 content_canvas = Canvas(mainframe, width=get_canvas_width(), height=2 * get_image_height(), yscrollincrement=32)
@@ -1829,31 +1805,25 @@ content_canvas.configure(yscrollcommand=content_scroll.set)
 content_canvas.grid(column=1, row=1, rowspan=2, columnspan=2, sticky=(N, S, E, W))
 content_scroll.grid(column=3, row=1, rowspan=2, sticky=(N, S))
 
-version = ttk.Label(tool_strip, text=" Version 1.0.0 ", state="disabled")
-version.grid(column=0, row=0, sticky=W)
-info = ttk.Label(tool_strip, anchor="center", state="disabled", textvariable=info_var)
-info.grid(column=1, row=0)
-operation = ttk.Label(tool_strip, anchor="center", state="disabled", textvariable=operation_var)
-operation.grid(column=2, row=0, sticky=E)
-progress = ttk.Progressbar(tool_strip, orient=HORIZONTAL, length=200, mode='determinate')
-progress.grid(column=3, row=0, sticky=W)
-progress.grid_remove()
+version_label = ttk.Label(tool_strip, text=" Version 1.0.0 ", state="disabled")
+version_label.grid(column=0, row=0, sticky=W)
+info_label = ttk.Label(tool_strip, anchor="center", state="disabled", textvariable=info_var)
+info_label.grid(column=1, row=0)
+operation_label = ttk.Label(tool_strip, anchor="center", state="disabled", textvariable=operation_var)
+operation_label.grid(column=2, row=0, sticky=E)
+progress_bar = ttk.Progressbar(tool_strip, orient=HORIZONTAL, length=200, mode='determinate')
+progress_bar.grid(column=3, row=0, sticky=W)
+progress_bar.grid_remove()
 copyright_notice = ttk.Label(tool_strip, text=" Copyright © 2026 EvokeMadness ", state="disabled")
 copyright_notice.grid(column=4, row=0, sticky=E)
 
-log_output = Text(log, height=8, state="disabled")
-log_output.grid(column=0, row=0, sticky=(N, S, E, W))
-log_scroll = ttk.Scrollbar(log, orient=VERTICAL, command=log_output.yview)
-log_scroll.grid(column=1, row=0, sticky=(N, S))
-log_output['yscrollcommand'] = log_scroll.set
+call_tk_command("build_log", str(mainframe))
 
-log_save = ttk.Button(log_tool_strip, text=" Save ", command=save_log)
-log_save.grid(column=0, row=0, sticky=W)
-log_clear = ttk.Button(log_tool_strip, text=" Clear ", command=clear_log)
-log_clear.grid(column=1, row=0, sticky=W)
-
-for child in (tool_strip, version, info, operation, copyright_notice):
+for child in (tool_strip, version_label, info_label, operation_label, copyright_notice):
     child.bind("<Button-1>", toggle_log)
+
+root.bind("<Control-grave>", toggle_log)
+root.bind("<Control-asciitilde>", toggle_log)
 
 root.bind("<Control-n>", new_session)
 root.bind("<Control-N>", new_session)
@@ -1870,13 +1840,13 @@ root.bind("<Control-G>", find_prev)
 root.bind("<Control-Shift-g>", find_prev)
 root.bind("<Control-Shift-G>", find_prev)
 root.bind("<F1>", show_help)
-category.bind("<<ComboboxSelected>>", on_category_select)
+category_combo.bind("<<ComboboxSelected>>", on_category_select)
 content_canvas.bind("<Enter>", bind_mousewheel)
 content_canvas.bind("<Leave>", unbind_mousewheel)
 material_list.bind("<<ListboxSelect>>", on_material_select)
 
 populate_categories(base_dir)
-if not category.get():
+if not category_combo.get():
     update_canvas_display([], [])
 
 load_debug_config(root, base_dir)
