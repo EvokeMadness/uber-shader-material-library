@@ -1,41 +1,55 @@
-import filecmp
 import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
+import webbrowser
 from tkinter import *
 from tkinter import filedialog
 from tkinter import ttk
+from urllib.parse import unquote, urlparse
 from PIL import Image, ImageOps, ImageTk
 
 base_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 canvas_sections = {}
 category_cache = {}
+clipboard_image_path = None
 current_target_dir = base_dir
 home_dir = os.path.expanduser("~")
 image_cache = {}
+image_context_menu = None
 info_clear_job = None
 output_manifest = {}
+recent_menu = None
+search_state = {"in_images": False, "index": -1, "match_word": False, "query": "", "results": []}
 staged_changes = {}
 
 
-def load_tcl_config(app_root, target_dir):
+def source_tcl_script(app_root, target_dir, filename):
     if app_root is None or not isinstance(target_dir, str):
         return
-    path = os.path.join(target_dir, "config.tcl")
+    path = os.path.join(target_dir, filename)
     if os.path.isfile(path):
         app_root.tk.call("source", path)
+
+
+def load_tcl_config(app_root, target_dir):
+    source_tcl_script(app_root, target_dir, "config.tcl")
 
 
 def load_style_config(app_root, target_dir):
-    if app_root is None or not isinstance(target_dir, str):
-        return
-    path = os.path.join(target_dir, "style.tcl")
-    if os.path.isfile(path):
-        app_root.tk.call("source", path)
+    source_tcl_script(app_root, target_dir, "style.tcl")
+
+
+def load_help_config(app_root, target_dir):
+    source_tcl_script(app_root, target_dir, "help.tcl")
+
+
+def load_find_config(app_root, target_dir):
+    source_tcl_script(app_root, target_dir, "find.tcl")
 
 
 def get_image_height():
@@ -51,12 +65,20 @@ def get_canvas_width():
 
 def get_manifests_dir(target_dir=None):
     src_dir = target_dir or current_target_dir
-    rel = "manifests"
+    default_dir = os.path.join(
+        os.environ.get("XDG_DATA_HOME") or os.path.join(home_dir, ".local", "share"),
+        "material-library-workbench",
+        "manifests"
+    )
+    raw_path = default_dir
     try:
-        rel = root.getvar("manifests_path")
+        raw_path = root.getvar("manifests_path") or default_dir
     except Exception:
         pass
-    return os.path.join(src_dir, rel)
+    expanded = os.path.expanduser(os.path.expandvars(raw_path))
+    if os.path.isabs(expanded):
+        return expanded
+    return os.path.join(src_dir, expanded)
 
 
 def get_scroll_step():
@@ -76,15 +98,20 @@ def populate_categories(target_dir=None):
     path = os.path.join(manifests_dir, "index.json")
     if os.path.isfile(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                cats = sorted(json.load(f).get("categories", {}).keys())
+            with open(path, "r", encoding="utf-8") as file_obj:
+                index_data = json.load(file_obj)
+            if target_dir is None:
+                saved_source = index_data.get("source_dir")
+                if saved_source and os.path.isdir(saved_source):
+                    current_target_dir = saved_source
+            cats = sorted(index_data.get("categories", {}).keys())
         except Exception:
             cats = []
     else:
         cats = sorted([
-            os.path.splitext(f)[0]
-            for f in os.listdir(manifests_dir)
-            if f.endswith(".json")
+            os.path.splitext(filename)[0]
+            for filename in os.listdir(manifests_dir)
+            if filename.endswith(".json")
         ])
 
     if cats:
@@ -135,6 +162,7 @@ def on_material_select(event=None):
         image_cache.pop(key, None)
     sel = material_list.curselection()
     if not sel:
+        images_in_material_var.set("Images in material: 0")
         update_canvas_display([], [])
         return
 
@@ -186,6 +214,7 @@ def on_material_select(event=None):
                 "rep": get_rep_data(img_rel, img_path)
             })
 
+    images_in_material_var.set(f"Images in material: {len(preview_items) + len(image_items)}")
     update_canvas_display(preview_items, image_items)
 
 
@@ -212,36 +241,46 @@ def get_image_resolution(image_path):
         return "Unknown"
 
 
+def is_entry_committed(entry):
+    return isinstance(entry, dict) and bool(
+        entry.get("committed") or entry.get("status") in ("modified", "deleted")
+    )
+
+
 def get_rep_data(rel_path, src_path=None):
     if not rel_path:
         return {}
+    entry = output_manifest.get(rel_path)
+    was_committed = is_entry_committed(entry)
     staged_path = staged_changes.get(rel_path)
     if staged_path and os.path.isfile(staged_path):
         return {
             "name": os.path.basename(staged_path),
             "path": staged_path,
             "resolution": get_image_resolution(staged_path),
-            "style": "Staged.TLabelframe"
+            "style": "Modified.TLabelframe" if was_committed else "Added.TLabelframe"
         }
     out_dir = output_var.get()
     if out_dir:
         out_path = os.path.join(out_dir, rel_path)
         if os.path.isfile(out_path):
-            same = False
-            if src_path and os.path.isfile(src_path):
-                try:
-                    same = filecmp.cmp(src_path, out_path, shallow=False)
-                except Exception:
-                    same = False
-            status = "added" if same else "modified"
-            if output_manifest.get(rel_path, {}).get("status") != status:
+            if not isinstance(entry, dict) or entry.get("status") == "deleted":
                 update_output_manifest_entry(rel_path, src_path, out_path)
+                entry = output_manifest.get(rel_path, {})
+            if entry.get("committed"):
+                style = "TLabelframe"
+            elif entry.get("status") == "modified":
+                style = "Modified.TLabelframe"
+            else:
+                style = "Added.TLabelframe"
             return {
                 "name": os.path.basename(out_path),
                 "path": out_path,
                 "resolution": get_image_resolution(out_path),
-                "style": "Added.TLabelframe" if same else "Modified.TLabelframe"
+                "style": style
             }
+        if isinstance(entry, dict) and entry.get("status") == "deleted":
+            return {"style": "Deleted.TLabelframe"}
         if rel_path in output_manifest:
             output_manifest.pop(rel_path, None)
             save_output_manifest(out_dir)
@@ -251,11 +290,13 @@ def get_rep_data(rel_path, src_path=None):
 def update_output_manifest_entry(rel_path, src_path, out_path):
     if not rel_path or not out_path or not os.path.isfile(out_path):
         return
+    prev_entry = output_manifest.get(rel_path)
+    was_committed = is_entry_committed(prev_entry)
     src_hash = get_file_sha256(src_path) if src_path and os.path.isfile(src_path) else ""
     out_hash = get_file_sha256(out_path)
-    status = "added" if (src_hash and src_hash == out_hash) else "modified"
     output_manifest[rel_path] = {
-        "status": status,
+        "committed": False,
+        "status": "modified" if was_committed else "added",
         "source_sha256": src_hash,
         "output_sha256": out_hash,
     }
@@ -276,7 +317,7 @@ def save_output_manifest(out_dir=None):
     target_out_dir = out_dir or output_var.get()
     if not target_out_dir or not os.path.isdir(target_out_dir) or is_source_dir(target_out_dir):
         return
-    path = os.path.join(target_out_dir, "material_manifest.json")
+    path = os.path.join(target_out_dir, "changes.json")
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(output_manifest, f, indent=2, sort_keys=True)
@@ -446,6 +487,22 @@ def add_pair(parent, pair_index, img_h=None, src_data=None, rep_data=None, rel_p
         slot.bind("<MouseWheel>", lambda event, p=pair: on_slot_zoom(event, p))
         slot.bind("<ButtonPress-2>", lambda event, p=pair: on_slot_pan_start(event, p))
         slot.bind("<B2-Motion>", lambda event, p=pair: on_slot_pan_move(event, p))
+
+    src_targets = [pair["src_slot"], pair["src"]]
+    if pair["src_name"]:
+        src_targets.extend([pair["src_name"], pair["src_name"].master])
+    if pair["src_res"]:
+        src_targets.extend([pair["src_res"], pair["src_res"].master])
+    for w in src_targets:
+        w.bind("<Button-3>", lambda event, p=pair: show_image_context_menu(event, True, p))
+
+    rep_targets = [pair["rep_slot"], pair["rep"]]
+    if pair["rep_name"]:
+        rep_targets.extend([pair["rep_name"], pair["rep_name"].master])
+    if pair["rep_res"]:
+        rep_targets.extend([pair["rep_res"], pair["rep_res"].master])
+    for w in rep_targets:
+        w.bind("<Button-3>", lambda event, p=pair: show_image_context_menu(event, False, p))
 
     if src_data is not None or rep_data is not None or rel_path is not None:
         update_pair(pair, img_h, src_data=src_data, rep_data=rep_data, rel_path=rel_path)
@@ -714,25 +771,63 @@ def refresh_pair_slots(pair):
     configure_photo_slot(pair["rep_slot"], pair.get("rep_data", {}).get("path"), max_size, zoom=zoom, pan=pan)
 
 
+def run_zenity_file_dialog(args):
+    if shutil.which("zenity"):
+        proc = subprocess.run(
+            ["zenity", "--file-selection", *args],
+            capture_output=True,
+            text=True,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    return None
+
+
+def get_image_format(image_path):
+    if not image_path:
+        return ""
+    if os.path.isfile(image_path):
+        try:
+            with Image.open(image_path) as img:
+                if img.format:
+                    return img.format.upper()
+        except Exception:
+            pass
+    ext = os.path.splitext(image_path)[1].lower().lstrip(".")
+    return {"jpg": "JPEG", "tif": "TIFF"}.get(ext, ext.upper())
+
+
+def validate_pair_image_format(pair, image_path):
+    rel_path = pair.get("rel_path")
+    src_data = pair.get("src_data", {})
+    src_fmt = get_image_format(src_data.get("path") or rel_path)
+    rep_fmt = get_image_format(image_path)
+    if src_fmt and rep_fmt != src_fmt:
+        write_to_log(f"Image format mismatch: expected {src_fmt}, got {rep_fmt or 'unknown'}!")
+        return False
+    return True
+
+
+def stage_pair_image(pair, path):
+    rel_path = pair.get("rel_path")
+    if not rel_path:
+        return
+    src_data = pair.get("src_data", {})
+    staged_changes[rel_path] = path
+    rep_data = get_rep_data(rel_path, src_data.get("path"))
+    update_pair(pair, pair.get("img_h"), src_data=src_data, rep_data=rep_data, rel_path=rel_path)
+
+
 def on_rep_click(pair):
     rel_path = pair.get("rel_path")
     if not rel_path:
         return
-    if shutil.which("zenity"):
-        proc = subprocess.run(
-            [
-                "zenity",
-                "--file-selection",
-                "--title=Select Image",
-                f"--filename={os.path.join(home_dir, '')}",
-                "--file-filter=Image Files | *.png *.jpg *.jpeg *.bmp *.tga *.tif *.tiff *.exr *.hdr *.webp",
-                "--file-filter=All Files | *",
-            ],
-            capture_output=True,
-            text=True
-        )
-        path = proc.stdout.strip() if proc.returncode == 0 else ""
-    else:
+    path = run_zenity_file_dialog([
+        "--title=Select Image",
+        f"--filename={os.path.join(home_dir, '')}",
+        "--file-filter=Image Files | *.png *.jpg *.jpeg *.bmp *.tga *.tif *.tiff *.exr *.hdr *.webp",
+        "--file-filter=All Files | *",
+    ])
+    if path is None:
         path = filedialog.askopenfilename(
             title="Select Image",
             initialdir=home_dir,
@@ -743,55 +838,62 @@ def on_rep_click(pair):
         )
     if not path or not os.path.isfile(path):
         return
-    staged_changes[rel_path] = path
-    src_data = pair.get("src_data", {})
-    rep_data = get_rep_data(rel_path, src_data.get("path"))
-    update_pair(pair, pair.get("img_h"), src_data=src_data, rep_data=rep_data, rel_path=rel_path)
+    if not validate_pair_image_format(pair, path):
+        return
+    stage_pair_image(pair, path)
 
 
 def on_left_arrow(pair):
     rel_path = pair.get("rel_path")
     if not rel_path:
         return
-    staged_path = staged_changes.get(rel_path)
-    if not staged_path or not os.path.isfile(staged_path):
+    rep_path = staged_changes.get(rel_path) or pair.get("rep_data", {}).get("path")
+    if not rep_path or not os.path.isfile(rep_path):
         write_to_log("Please select a replacement image first!")
         return
-    commit_pair_image(pair, staged_path)
+    if not output_var.get():
+        write_to_log("You have to save first!")
+        return
+    commit_pair_image(pair, rep_path)
 
 
 def on_right_arrow(pair):
     rel_path = pair.get("rel_path")
     if not rel_path:
         return
-    src_path = pair.get("src_data", {}).get("path")
+    src_data = pair.get("src_data", {})
+    src_path = src_data.get("path")
+    if not src_path or not os.path.isfile(src_path):
+        src_path = resolve_image_path(rel_path)
     if not src_path or not os.path.isfile(src_path):
         write_to_log("Source image was not found on disk!")
         return
-    commit_pair_image(pair, src_path)
+    stage_pair_image(pair, src_path)
 
 
 def commit_pair_image(pair, copy_src):
-    rel_path = pair.get("rel_path")
+    if not validate_pair_image_format(pair, copy_src):
+        return
     out_dir = output_var.get()
     if not out_dir:
-        save_as_library()
-        out_dir = output_var.get()
-        if not out_dir:
-            return
+        write_to_log("You have to save first!")
+        return
+    rel_path = pair.get("rel_path")
+    src_data = pair.get("src_data", {})
     dst_path = os.path.join(out_dir, rel_path)
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-    shutil.copy2(copy_src, dst_path)
-    staged_changes.pop(rel_path, None)
-    evict_image_cache(dst_path)
-    src_data = pair.get("src_data", {})
+    if os.path.abspath(copy_src) != os.path.abspath(dst_path):
+        shutil.copy2(copy_src, dst_path)
+        evict_image_cache(dst_path)
     update_output_manifest_entry(rel_path, src_data.get("path"), dst_path)
+    staged_changes.pop(rel_path, None)
     rep_data = get_rep_data(rel_path, src_data.get("path"))
     update_pair(pair, pair.get("img_h"), src_data=src_data, rep_data=rep_data, rel_path=rel_path)
 
 
 def on_clear_pair(pair):
     rel_path = pair.get("rel_path")
+    src_data = pair.get("src_data", {})
     if rel_path:
         staged_changes.pop(rel_path, None)
         out_dir = output_var.get()
@@ -799,12 +901,21 @@ def on_clear_pair(pair):
             out_path = os.path.join(out_dir, rel_path)
             if os.path.isfile(out_path):
                 os.remove(out_path)
-            if rel_path in output_manifest:
+            entry = output_manifest.get(rel_path)
+            was_committed = is_entry_committed(entry)
+            if was_committed:
+                output_manifest[rel_path] = {
+                    "committed": False,
+                    "status": "deleted",
+                    "source_sha256": entry.get("source_sha256", ""),
+                    "output_sha256": "",
+                }
+            else:
                 output_manifest.pop(rel_path, None)
-                save_output_manifest(out_dir)
+            save_output_manifest(out_dir)
             evict_image_cache(out_path)
-    src_data = pair.get("src_data", {})
-    update_pair(pair, pair.get("img_h"), src_data=src_data, rep_data={}, rel_path=rel_path)
+    rep_data = get_rep_data(rel_path, src_data.get("path"))
+    update_pair(pair, pair.get("img_h"), src_data=src_data, rep_data=rep_data, rel_path=rel_path)
 
 
 def evict_image_cache(image_path):
@@ -815,18 +926,463 @@ def evict_image_cache(image_path):
         image_cache.pop(key, None)
 
 
+def open_with_image_viewer(filepath):
+    if not filepath or not os.path.isfile(filepath):
+        write_to_log("Image file not found on disk!")
+        return
+    abs_path = os.path.abspath(filepath)
+    try:
+        subprocess.Popen(["xdg-open", abs_path])
+        write_to_log(f'Opened "{os.path.basename(abs_path)}" with image viewer.')
+    except Exception as e:
+        write_to_log(f"Error opening image viewer: {e}")
+
+
+def open_containing_folder(filepath):
+    if not filepath:
+        write_to_log("Image path not found!")
+        return
+    abs_path = os.path.abspath(filepath)
+    folder = os.path.dirname(abs_path)
+    if not os.path.isdir(folder):
+        write_to_log("Containing folder not found on disk!")
+        return
+    try:
+        subprocess.Popen(["xdg-open", folder])
+        write_to_log(f'Opened containing folder "{folder}".')
+    except Exception as e:
+        write_to_log(f"Error opening containing folder: {e}")
+
+
+def set_clipboard_image_path(path):
+    global clipboard_image_path
+    if not path or not os.path.isfile(path):
+        return
+    clipboard_image_path = os.path.abspath(path)
+    try:
+        root.clipboard_clear()
+        root.clipboard_append(clipboard_image_path)
+    except Exception:
+        pass
+
+
+def get_clipboard_image_path():
+    if clipboard_image_path and os.path.isfile(clipboard_image_path):
+        return clipboard_image_path
+    try:
+        cb_text = root.clipboard_get()
+        if cb_text:
+            text = cb_text.strip()
+            if text.startswith("file://"):
+                path = unquote(urlparse(text).path)
+            else:
+                line = text.splitlines()[0].strip()
+                if line.startswith("file://"):
+                    path = unquote(urlparse(line).path)
+                else:
+                    path = line
+            if os.path.isfile(path) and get_image_format(path):
+                return path
+    except Exception:
+        pass
+    return None
+
+
+def on_cut_image(pair, path):
+    if not path or not os.path.isfile(path):
+        return
+    set_clipboard_image_path(path)
+    on_clear_pair(pair)
+    write_to_log(f'Cut "{os.path.basename(path)}".')
+
+
+def on_copy_image(path):
+    if not path or not os.path.isfile(path):
+        return
+    set_clipboard_image_path(path)
+    write_to_log(f'Copied "{os.path.basename(path)}".')
+
+
+def on_paste_image(pair):
+    rel_path = pair.get("rel_path")
+    if not rel_path:
+        return
+    paste_path = get_clipboard_image_path()
+    if not paste_path or not os.path.isfile(paste_path):
+        write_to_log("No valid image file found on clipboard!")
+        return
+
+    if not validate_pair_image_format(pair, paste_path):
+        return
+    stage_pair_image(pair, paste_path)
+    write_to_log(f'Pasted "{os.path.basename(paste_path)}".')
+
+
+def dismiss_context_menu():
+    try:
+        image_context_menu.unpost()
+    except Exception:
+        pass
+
+
+def show_image_context_menu(event, is_source, pair):
+    rel_path = pair.get("rel_path")
+    src_data = pair.get("src_data", {})
+    rep_data = pair.get("rep_data", {})
+
+    if is_source:
+        img_path = src_data.get("path")
+        if not img_path and rel_path:
+            img_path = resolve_image_path(rel_path)
+    else:
+        staged_path = staged_changes.get(rel_path)
+        img_path = staged_path or rep_data.get("path")
+
+    has_img = bool(img_path and os.path.isfile(img_path))
+    clipboard_src = get_clipboard_image_path()
+    can_paste = bool(not is_source and rel_path and clipboard_src and os.path.isfile(clipboard_src))
+
+    image_context_menu.delete(0, END)
+    image_context_menu.add_command(
+        label="Open With Image Viewer",
+        state="normal" if has_img else "disabled",
+        command=lambda p=img_path: (dismiss_context_menu(), open_with_image_viewer(p))
+    )
+    image_context_menu.add_command(
+        label="Open Containing Folder",
+        state="normal" if has_img else "disabled",
+        command=lambda p=img_path: (dismiss_context_menu(), open_containing_folder(p))
+    )
+    image_context_menu.add_separator()
+    image_context_menu.add_command(
+        label="Cut",
+        state="normal" if (not is_source and has_img) else "disabled",
+        command=lambda p=pair, pth=img_path: (dismiss_context_menu(), on_cut_image(p, pth))
+    )
+    image_context_menu.add_command(
+        label="Copy",
+        state="normal" if has_img else "disabled",
+        command=lambda pth=img_path: (dismiss_context_menu(), on_copy_image(pth))
+    )
+    image_context_menu.add_separator()
+    image_context_menu.add_command(
+        label="Paste",
+        state="normal" if can_paste else "disabled",
+        command=lambda p=pair: (dismiss_context_menu(), on_paste_image(p))
+    )
+
+    image_context_menu.tk_popup(event.x_root, event.y_root)
+
+
 def on_category_select(event=None):
     populate_materials(current_target_dir, category_var.get())
 
 
-def open_library(title="Open Directory"):
-    target_dir = ask_directory_dialog(title if isinstance(title, str) else "Open Directory")
+def new_session(event=None):
+    output_var.set("")
+    staged_changes.clear()
+    output_manifest.clear()
+    image_cache.clear()
+    on_material_select()
+    write_to_log("New session.")
+
+
+def get_appdata_dir():
+    candidates = []
+    if os.environ.get("XDG_DATA_HOME"):
+        candidates.append(os.path.join(os.environ["XDG_DATA_HOME"], "material-library-workbench"))
+    candidates.append(os.path.expanduser("~/.local/share/material-library-workbench"))
+    candidates.append(os.path.expanduser("~/.config/material-library-workbench"))
+
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    target = os.path.join(base, "material-library-workbench")
+    try:
+        os.makedirs(target, exist_ok=True)
+    except Exception:
+        pass
+    return target
+
+
+def get_recent_files_path():
+    return os.path.join(get_appdata_dir(), "recently_used.json")
+
+
+def load_recent_files():
+    path = get_recent_files_path()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return [str(p) for p in data if isinstance(p, str)][:5]
+    except Exception:
+        pass
+    return []
+
+
+def save_recent_files(recent_list):
+    path = get_recent_files_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(recent_list[:5], f, indent=2)
+    except Exception:
+        pass
+
+
+def add_recent_file(file_path):
+    if not file_path:
+        return
+    norm_path = os.path.abspath(file_path)
+    recent_list = load_recent_files()
+    recent_list = [p for p in recent_list if os.path.abspath(p) != norm_path]
+    recent_list.insert(0, norm_path)
+    save_recent_files(recent_list[:5])
+    update_recent_menu()
+
+
+def remove_recent_file(file_path):
+    if not file_path:
+        return
+    norm_path = os.path.abspath(file_path)
+    recent_list = load_recent_files()
+    filtered = [p for p in recent_list if os.path.abspath(p) != norm_path]
+    if len(filtered) != len(recent_list):
+        save_recent_files(filtered)
+        update_recent_menu()
+
+
+def clear_recent_files():
+    save_recent_files([])
+    update_recent_menu()
+
+
+def update_recent_menu():
+    if recent_menu is None:
+        return
+    recent_menu.delete(0, END)
+    recent_files = load_recent_files()
+    if not recent_files:
+        recent_menu.add_command(label="(Empty)", state="disabled")
+    else:
+        for i, file_path in enumerate(recent_files, start=1):
+            recent_menu.add_command(
+                label=f"{i} {file_path}",
+                underline=0,
+                command=lambda p=file_path: open_session(target_path=p),
+            )
+    recent_menu.add_separator()
+    recent_menu.add_command(
+        label="Clear",
+        command=clear_recent_files,
+        state="normal" if recent_files else "disabled",
+    )
+
+
+def open_session(title="Open", target_path=None):
+    if target_path:
+        manifest_path = os.path.abspath(target_path)
+        if not os.path.isfile(manifest_path):
+            write_to_log(f'File "{manifest_path}" was not found on disk!')
+            remove_recent_file(manifest_path)
+            return
+    else:
+        manifest_path = ask_manifest_dialog(title if isinstance(title, str) else "Open")
+        if not manifest_path or not os.path.isfile(manifest_path):
+            return
+
+    target_out_dir = os.path.dirname(os.path.abspath(manifest_path))
+    if is_source_dir(target_out_dir):
+        write_to_log("You cannot select the source directory!")
+        return
+
+    output_var.set(target_out_dir)
+    staged_changes.clear()
+    load_output_manifest(manifest_path)
+    add_recent_file(manifest_path)
+    on_material_select()
+    write_to_log(f'Loaded session from "{manifest_path}".')
+
+
+def call_tk_command(cmd):
+    try:
+        root.tk.call(cmd)
+    except Exception:
+        pass
+
+
+def show_help(event=None):
+    call_tk_command("show_help")
+
+
+def show_find(event=None):
+    call_tk_command("show_find")
+
+
+def find_next(event=None):
+    call_tk_command("find_next")
+
+
+def find_prev(event=None):
+    call_tk_command("find_prev")
+
+
+def perform_find(query_str, match_word_flag, in_images_flag, direction_str):
+    query = str(query_str).strip()
+    if not query:
+        return
+
+    match_word = str(match_word_flag).lower() in ("1", "true")
+    in_images = str(in_images_flag).lower() in ("1", "true")
+    try:
+        direction = int(direction_str)
+    except Exception:
+        direction = 1
+
+    cache_key = (query, match_word, in_images)
+    prev_key = (search_state["query"], search_state["match_word"], search_state["in_images"])
+
+    if cache_key != prev_key or not search_state["results"]:
+        if match_word:
+            pattern = re.compile(rf"\b{re.escape(query)}\b", re.IGNORECASE)
+            is_match = lambda s: bool(pattern.search(s)) if s else False
+        else:
+            q_lower = query.lower()
+            is_match = lambda s: q_lower in s.lower() if s else False
+
+        cats = list(category["values"])
+        if not cats:
+            manifests_dir = get_manifests_dir(current_target_dir)
+            if os.path.isdir(manifests_dir):
+                cats = sorted([
+                    os.path.splitext(f)[0]
+                    for f in os.listdir(manifests_dir)
+                    if f.endswith(".json") and f != "index.json"
+                ])
+
+        name_matches = []
+        image_matches = []
+        for cat in cats:
+            cat_data = get_category_data(current_target_dir, cat)
+            for mat_name, mat_info in cat_data.get("materials", {}).items():
+                if is_match(mat_name):
+                    name_matches.append((cat, mat_name))
+                elif in_images:
+                    imgs = mat_info.get("images", [])
+                    prev_path = mat_info.get("preview", "")
+                    if any(is_match(img) for img in imgs) or (prev_path and is_match(os.path.basename(prev_path))):
+                        image_matches.append((cat, mat_name))
+
+        results = name_matches + image_matches
+        search_state["query"] = query
+        search_state["match_word"] = match_word
+        search_state["in_images"] = in_images
+        search_state["results"] = results
+
+        curr_cat = category_var.get()
+        sel = material_list.curselection()
+        curr_mat = material_list.get(sel[0]) if sel else None
+        current_pair = (curr_cat, curr_mat)
+
+        if current_pair in results:
+            curr_pos = results.index(current_pair)
+            search_state["index"] = (curr_pos + direction) % len(results)
+        else:
+            search_state["index"] = 0 if direction >= 0 else len(results) - 1
+    else:
+        results = search_state["results"]
+        if results:
+            search_state["index"] = (search_state["index"] + direction) % len(results)
+
+    if not search_state["results"]:
+        write_to_log(f'Phrase not found')
+        return
+
+    idx = search_state["index"]
+    target_cat, target_mat = search_state["results"][idx]
+
+    if category_var.get() != target_cat:
+        category.set(target_cat)
+        category_var.set(target_cat)
+        populate_materials(current_target_dir, target_cat)
+
+    all_mats = material_list.get(0, END)
+    if target_mat in all_mats:
+        mat_idx = all_mats.index(target_mat)
+        material_list.selection_clear(0, END)
+        material_list.selection_set(mat_idx)
+        material_list.activate(mat_idx)
+        material_list.see(mat_idx)
+        on_material_select()
+
+    write_to_log(f'{idx + 1} of {len(results)} matches')
+
+
+MANIFEST_FILETYPES = [
+    ("Changes Manifest", "changes.json"),
+    ("JSON Files", "*.json"),
+    ("All Files", "*.*"),
+]
+MANIFEST_ZENITY_FILTERS = [
+    "--file-filter=Changes Manifest (changes.json) | changes.json",
+    "--file-filter=JSON Files | *.json",
+    "--file-filter=All Files | *",
+]
+
+
+def ask_manifest_dialog(title="Open"):
+    initial_dir = output_var.get() or home_dir
+    initial_file = os.path.join(initial_dir, "changes.json")
+    path = run_zenity_file_dialog([
+        f"--title={title}",
+        f"--filename={initial_file}",
+        *MANIFEST_ZENITY_FILTERS,
+    ])
+    if path is not None:
+        return path
+    return filedialog.askopenfilename(
+        title=title,
+        initialdir=initial_dir,
+        filetypes=MANIFEST_FILETYPES,
+    )
+
+
+def ask_save_manifest_dialog(title="Save"):
+    initial_dir = output_var.get() or home_dir
+    initial_file = os.path.join(initial_dir, "changes.json")
+    path = run_zenity_file_dialog([
+        "--save",
+        "--confirm-overwrite",
+        f"--title={title}",
+        f"--filename={initial_file}",
+        *MANIFEST_ZENITY_FILTERS,
+    ])
+    if path is not None:
+        return path
+    return filedialog.asksaveasfilename(
+        title=title,
+        initialdir=initial_dir,
+        initialfile="changes.json",
+        defaultextension=".json",
+        filetypes=MANIFEST_FILETYPES,
+    )
+
+
+def import_library(title="Import Library"):
+    target_dir = ask_directory_dialog(title if isinstance(title, str) else "Import Library")
     if not target_dir or not os.path.isfile(os.path.join(target_dir, "radeon-prorender-material-library.blend")):
         return
 
-    script = os.path.join(base_dir, "generate_manifest.py")
-    if not os.path.isfile(script):
+    previews_script = os.path.join(base_dir, "import_previews.py")
+    manifest_script = os.path.join(base_dir, "generate_manifest.py")
+    if not os.path.isfile(manifest_script):
         return
+
+    manifests_dir = get_manifests_dir(target_dir)
 
     blend_files = [
         f for f in os.listdir(target_dir)
@@ -834,10 +1390,49 @@ def open_library(title="Open Directory"):
     ]
     total_categories = len(blend_files)
 
-    progress["maximum"] = max(1, total_categories)
+    tasks = []
+    if os.path.isfile(previews_script):
+        tasks.append((
+            "Importing previews",
+            ["blender", "--factory-startup", "-b", "--python", previews_script, "--", target_dir],
+            ("previews", "preview")
+        ))
+    tasks.append((
+        "Generating manifests",
+        ["blender", "--factory-startup", "-b", "--python", manifest_script, "--", target_dir, manifests_dir],
+        ("materials", "material")
+    ))
+
+    def on_open_complete():
+        category_cache.clear()
+        image_cache.clear()
+        staged_changes.clear()
+        populate_categories(target_dir)
+
+    run_blender_tasks(tasks, total_categories, on_open_complete)
+
+
+def ask_directory_dialog(title="Open Directory"):
+    initial_dir = os.path.dirname(output_var.get()) if output_var.get() else home_dir
+    path = run_zenity_file_dialog([
+        "--directory",
+        f"--title={title}",
+        f"--filename={os.path.join(initial_dir, '')}",
+    ])
+    if path is not None:
+        return path
+    return filedialog.askdirectory(title=title, initialdir=initial_dir)
+
+
+def run_blender_tasks(tasks, total_steps, on_complete=None):
+    if not tasks:
+        return
+
+    total_count = max(1, total_steps)
+    progress["maximum"] = total_count
     progress["value"] = 0
     progress.grid()
-    operation_var.set(f"Generating manifests (0/{total_categories})...")
+    operation_var.set(f"{tasks[0][0]} (0/{total_steps})...")
 
     worker_queue = queue.Queue()
 
@@ -849,18 +1444,19 @@ def open_library(title="Open Directory"):
                     progress["value"] = progress["maximum"]
                     progress.grid_remove()
                     operation_var.set("")
-                    category_cache.clear()
-                    image_cache.clear()
-                    staged_changes.clear()
-                    populate_categories(target_dir)
+                    if on_complete:
+                        on_complete()
                     return
                 action, payload = msg
                 if action == "log":
                     append_log(payload)
+                elif action == "phase":
+                    progress["value"] = 0
+                    operation_var.set(f"{payload} (0/{total_steps})...")
                 elif action == "step":
-                    val, name = payload
+                    phase_label, val, name = payload
                     progress["value"] = val
-                    operation_var.set(f"Generating manifests ({val}/{total_categories}): {name}")
+                    operation_var.set(f"{phase_label} ({val}/{total_steps}): {name}")
         except queue.Empty:
             pass
         root.after(50, process_queue)
@@ -870,26 +1466,30 @@ def open_library(title="Open Directory"):
     def run_worker():
         try:
             env = dict(os.environ, PYTHONUNBUFFERED="1")
-            proc = subprocess.Popen(
-                ["blender", "--factory-startup", "-b", "--python", script, "--", target_dir],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env=env
-            )
-            completed = 0
-            for line in iter(proc.stdout.readline, ""):
-                if line.startswith("Blender "):
-                    continue
-                worker_queue.put(("log", line))
-                stripped = line.strip()
-                if ": " in stripped and (stripped.endswith("materials") or stripped.endswith("material")):
-                    completed += 1
-                    cat_name = stripped.split(":", 1)[0].strip()
-                    worker_queue.put(("step", (completed, cat_name)))
-            proc.stdout.close()
-            proc.wait()
+            for phase_label, cmd, suffixes in tasks:
+                worker_queue.put(("phase", phase_label))
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=env
+                )
+                completed = 0
+                for line in iter(proc.stdout.readline, ""):
+                    if line.startswith("Blender "):
+                        continue
+                    if "Engine 'RPR' not available" in line:
+                        continue
+                    worker_queue.put(("log", line))
+                    stripped = line.strip()
+                    if ": " in stripped and stripped.endswith(suffixes):
+                        completed += 1
+                        cat_name = stripped.split(":", 1)[0].strip()
+                        worker_queue.put(("step", (phase_label, completed, cat_name)))
+                proc.stdout.close()
+                proc.wait()
         except Exception as exc:
             worker_queue.put(("log", f"Error: {exc}\n"))
         finally:
@@ -898,45 +1498,108 @@ def open_library(title="Open Directory"):
     threading.Thread(target=run_worker, daemon=True).start()
 
 
-def ask_directory_dialog(title="Open Directory"):
-    if shutil.which("zenity"):
-        proc = subprocess.run(
-            [
-                "zenity",
-                "--file-selection",
-                "--directory",
-                f"--title={title}",
-                f"--filename={os.path.join(home_dir, '')}",
-            ],
-            capture_output=True,
-            text=True
-        )
-        return proc.stdout.strip() if proc.returncode == 0 else ""
-    return filedialog.askdirectory(title=title, initialdir=home_dir)
-
-
-def save_library(title="Save Directory"):
+def save_library(title="Save"):
     out_dir = output_var.get()
-    if out_dir:
-        perform_save(out_dir)
+    if not out_dir:
+        manifest_path = ask_save_manifest_dialog(title if isinstance(title, str) else "Save")
+        if not manifest_path:
+            return
+        chosen_dir = (
+            os.path.abspath(manifest_path)
+            if os.path.isdir(manifest_path)
+            else os.path.dirname(os.path.abspath(manifest_path))
+        )
+        if not perform_save(chosen_dir, create_subdir=True):
+            return
+        out_dir = output_var.get()
+        if not out_dir:
+            return
+
+    for rel_path, staged_src in list(staged_changes.items()):
+        if staged_src and os.path.isfile(staged_src):
+            dst_path = os.path.join(out_dir, rel_path)
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            if os.path.abspath(staged_src) != os.path.abspath(dst_path):
+                shutil.copy2(staged_src, dst_path)
+                evict_image_cache(dst_path)
+            src_path = resolve_image_path(rel_path)
+            update_output_manifest_entry(rel_path, src_path, dst_path)
+    staged_changes.clear()
+
+    changed_preview_cats = {
+        rel_path.replace("\\", "/").split("/")[2]
+        for rel_path, info in output_manifest.items()
+        if isinstance(info, dict) and not info.get("committed")
+        and rel_path.replace("\\", "/").startswith("rprmaterials/Previews/")
+        and len(rel_path.replace("\\", "/").split("/")) >= 4
+    }
+
+    def finalize_commit():
+        deleted_keys = [
+            k for k, v in output_manifest.items()
+            if isinstance(v, dict) and v.get("status") == "deleted"
+        ]
+        for k in deleted_keys:
+            output_manifest.pop(k, None)
+        for entry in output_manifest.values():
+            if isinstance(entry, dict):
+                entry["committed"] = True
+        save_output_manifest(out_dir)
+        on_material_select()
+        manifest_path = os.path.join(out_dir, "changes.json")
+        add_recent_file(manifest_path)
+        write_to_log(f'Saved session to "{manifest_path}".')
+
+    build_script = os.path.join(base_dir, "build_material_library.py")
+    if changed_preview_cats and os.path.isfile(build_script):
+        run_blender_tasks(
+            [(
+                "Updating previews",
+                ["blender", "--factory-startup", "-b", "--python", build_script, "--", "--previews", out_dir],
+                ("previews", "preview")
+            )],
+            len(changed_preview_cats),
+            finalize_commit
+        )
     else:
-        save_as_library(title)
+        finalize_commit()
 
 
 def save_as_library(title="Save Directory"):
     out_dir = ask_directory_dialog(title if isinstance(title, str) else "Save Directory")
     if not out_dir:
         return
-    perform_save(out_dir)
+    if perform_save(out_dir, create_subdir=True):
+        save_library()
 
 
-def perform_save(out_dir):
+def copy_library_assets(src_dir, dst_dir, overwrite=True):
+    if not src_dir or not os.path.isdir(src_dir):
+        return
+    for filename in sorted(os.listdir(src_dir)):
+        if filename.endswith(".blend") or filename == "blender_assets.cats.txt":
+            src_file = os.path.join(src_dir, filename)
+            dst_file = os.path.join(dst_dir, filename)
+            if os.path.isfile(src_file) and (overwrite or not os.path.isfile(dst_file)):
+                shutil.copy2(src_file, dst_file)
+
+
+def perform_save(out_dir, create_subdir=True):
     if not out_dir:
-        return
+        return False
 
-    if is_source_dir(out_dir):
+    if create_subdir:
+        target_out_dir = (
+            out_dir
+            if os.path.basename(os.path.normpath(out_dir)) == "uber-shader-material-library"
+            else os.path.join(out_dir, "uber-shader-material-library")
+        )
+    else:
+        target_out_dir = out_dir
+
+    if is_source_dir(out_dir) or is_source_dir(target_out_dir):
         write_to_log("You cannot select the source directory!")
-        return
+        return False
 
     scaffold_dirs = (
         "rprmaterials",
@@ -946,21 +1609,38 @@ def perform_save(out_dir):
         os.path.join("rprmaterials", "Previews"),
     )
     for rel_dir in scaffold_dirs:
-        os.makedirs(os.path.join(out_dir, rel_dir), exist_ok=True)
+        os.makedirs(os.path.join(target_out_dir, rel_dir), exist_ok=True)
 
-    output_var.set(out_dir)
-    output_dir_var.set(f"Output directory: {out_dir}")
-    load_output_manifest(out_dir)
-    on_material_select()
+    copy_library_assets(current_target_dir, target_out_dir, overwrite=False)
+
+    old_out_dir = output_var.get()
+    if old_out_dir and os.path.isdir(old_out_dir) and os.path.abspath(old_out_dir) != os.path.abspath(target_out_dir):
+        old_manifest_file = os.path.join(old_out_dir, "changes.json")
+        new_manifest_file = os.path.join(target_out_dir, "changes.json")
+        if os.path.isfile(old_manifest_file) and not os.path.isfile(new_manifest_file):
+            shutil.copy2(old_manifest_file, new_manifest_file)
+        copy_library_assets(old_out_dir, target_out_dir, overwrite=True)
+        old_rpr = os.path.join(old_out_dir, "rprmaterials")
+        new_rpr = os.path.join(target_out_dir, "rprmaterials")
+        if os.path.isdir(old_rpr):
+            shutil.copytree(old_rpr, new_rpr, dirs_exist_ok=True)
+
+    image_cache.clear()
+    output_var.set(target_out_dir)
+    return True
 
 
-def load_output_manifest(out_dir=None):
+def load_output_manifest(target=None):
     output_manifest.clear()
-    target_out_dir = out_dir or output_var.get()
+    if target and os.path.isfile(target):
+        path = target
+        target_out_dir = os.path.dirname(os.path.abspath(target))
+    else:
+        target_out_dir = target or output_var.get()
+        path = os.path.join(target_out_dir, "changes.json") if target_out_dir else None
     if not target_out_dir or not os.path.isdir(target_out_dir):
         return
-    path = os.path.join(target_out_dir, "material_manifest.json")
-    if os.path.isfile(path):
+    if path and os.path.isfile(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -972,14 +1652,18 @@ def load_output_manifest(out_dir=None):
         save_output_manifest(target_out_dir)
 
 
-def write_to_log(msg, info_msg=None):
-    global info_clear_job
+def append_log(text):
     log_output.configure(state="normal")
-    if log_output.index("end-1c") != "1.0":
+    if log_output.index("end-1c") != "1.0" and log_output.get("end-2c") != "\n":
         log_output.insert(END, "\n")
-    log_output.insert(END, str(msg))
+    log_output.insert(END, text)
     log_output.see(END)
     log_output.configure(state="disabled")
+
+
+def write_to_log(msg, info_msg=None):
+    global info_clear_job
+    append_log(f"{str(msg)}\n")
 
     if not is_debug_mode():
         if info_clear_job is not None:
@@ -999,13 +1683,6 @@ def write_to_log(msg, info_msg=None):
                 info.configure(style="TLabel")
 
         info_clear_job = root.after(5000, clear_info)
-
-
-def append_log(text):
-    log_output.configure(state="normal")
-    log_output.insert(END, text)
-    log_output.see(END)
-    log_output.configure(state="disabled")
 
 
 def toggle_log(event=None):
@@ -1046,16 +1723,6 @@ def is_debug_mode(app_root=None):
         return False
 
 
-def set_preview_image_counts(num_previews=1, num_images=1):
-    try:
-        n_prev = max(0, int(num_previews))
-        n_img = max(0, int(num_images))
-    except (ValueError, TypeError):
-        return
-
-    update_canvas_display([{} for _ in range(n_prev)], [{} for _ in range(n_img)])
-
-
 def load_debug_config(app_root, target_dir):
     if app_root is None or not isinstance(target_dir, str):
         return
@@ -1067,9 +1734,8 @@ def load_debug_config(app_root, target_dir):
         info_var.set("Debug")
         info.configure(style="Debug.TLabel")
 
-    path = os.path.join(target_dir, "debug.tcl")
-    if is_debug and os.path.isfile(path):
-        app_root.tk.call("source", path)
+    if is_debug:
+        source_tcl_script(app_root, target_dir, "debug.tcl")
 
 
 root = Tk()
@@ -1079,19 +1745,22 @@ root.resizable(False, False)
 root.columnconfigure(0, weight=1)
 root.rowconfigure(0, weight=1)
 
-root.createcommand("set_preview_image_counts", set_preview_image_counts)
 root.createcommand("toggle_log", toggle_log)
 root.createcommand("clear_log", clear_log)
 root.createcommand("write_to_log", write_to_log)
+root.createcommand("open_help_url", webbrowser.open)
+root.createcommand("perform_find", perform_find)
 
 load_tcl_config(root, base_dir)
 load_style_config(root, base_dir)
+load_help_config(root, base_dir)
+load_find_config(root, base_dir)
 
 category_var = StringVar()
+images_in_material_var = StringVar(value="Images in material: 0")
 info_var = StringVar()
 materials_in_category_var = StringVar(value="Materials in category: 0")
 operation_var = StringVar()
-output_dir_var = StringVar(value="Output directory:")
 output_var = StringVar()
 
 mainframe = ttk.Frame(root)
@@ -1122,14 +1791,25 @@ menubar = Menu(root)
 file_menu = Menu(menubar)
 search_menu = Menu(menubar)
 help_menu = Menu(menubar)
+image_context_menu = Menu(root, tearoff=0)
+recent_menu = Menu(file_menu, tearoff=0)
 menubar.add_cascade(menu=file_menu, label="File")
 menubar.add_cascade(menu=search_menu, label="Search")
 menubar.add_cascade(menu=help_menu, label="Help")
-file_menu.add_command(label='Open...', accelerator='Ctrl+O', command=open_library)
+file_menu.add_command(label='New', accelerator='Ctrl+N', underline=0, command=new_session)
+file_menu.add_command(label='Open...', accelerator='Ctrl+O', underline=0, command=open_session)
+file_menu.add_command(label='Save', accelerator='Ctrl+S', underline=0, command=save_library)
+file_menu.add_command(label='Save As...', accelerator='Ctrl+Shift+S', underline=5, command=save_as_library)
 file_menu.add_separator()
-file_menu.add_command(label='Save', accelerator='Ctrl+S', command=save_library)
-file_menu.add_command(label='Save As...', accelerator='Ctrl+Shift+S', command=save_as_library)
+file_menu.add_cascade(label='Most Recently Used', menu=recent_menu, underline=0)
+file_menu.add_separator()
+file_menu.add_command(label='Import Library', command=import_library)
+search_menu.add_command(label='Find', accelerator='Ctrl+F', command=show_find)
+search_menu.add_command(label='Find Next', accelerator='Ctrl+G', command=find_next)
+search_menu.add_command(label='Find Previous', accelerator='Shift+Ctrl+G', command=find_prev)
+help_menu.add_command(label='Manual', accelerator='F1', command=show_help)
 root['menu'] = menubar
+update_recent_menu()
 
 category = ttk.Combobox(mainframe, textvariable=category_var)
 category.state(["readonly"])
@@ -1137,8 +1817,8 @@ category.grid(column=0, row=0, sticky=(W, E))
 
 materials_in_category = ttk.Label(mainframe, textvariable=materials_in_category_var, anchor="w", relief="sunken")
 materials_in_category.grid(column=1, row=0, sticky=(W, E))
-output_dir_status = ttk.Label(mainframe, textvariable=output_dir_var, anchor="w", relief="sunken", width=1)
-output_dir_status.grid(column=2, row=0, sticky=(W, E))
+images_in_material = ttk.Label(mainframe, textvariable=images_in_material_var, anchor="w", relief="sunken")
+images_in_material.grid(column=2, row=0, sticky=(W, E))
 
 material_list = Listbox(material, exportselection=False)
 material_list.grid(column=0, row=0, sticky=(N, S, E, W))
@@ -1158,7 +1838,7 @@ operation.grid(column=2, row=0, sticky=E)
 progress = ttk.Progressbar(tool_strip, orient=HORIZONTAL, length=200, mode='determinate')
 progress.grid(column=3, row=0, sticky=W)
 progress.grid_remove()
-copyright_notice = ttk.Label(tool_strip, text=" © 2026 EvokeMadness ", state="disabled")
+copyright_notice = ttk.Label(tool_strip, text=" Copyright © 2026 EvokeMadness ", state="disabled")
 copyright_notice.grid(column=4, row=0, sticky=E)
 
 log_output = Text(log, height=8, state="disabled")
@@ -1175,12 +1855,21 @@ log_clear.grid(column=1, row=0, sticky=W)
 for child in (tool_strip, version, info, operation, copyright_notice):
     child.bind("<Button-1>", toggle_log)
 
-root.bind("<Control-o>", open_library)
-root.bind("<Control-O>", open_library)
+root.bind("<Control-n>", new_session)
+root.bind("<Control-N>", new_session)
+root.bind("<Control-o>", open_session)
+root.bind("<Control-O>", open_session)
 root.bind("<Control-s>", save_library)
 root.bind("<Control-S>", save_as_library)
 root.bind("<Control-Shift-s>", save_as_library)
 root.bind("<Control-Shift-S>", save_as_library)
+root.bind("<Control-f>", show_find)
+root.bind("<Control-F>", show_find)
+root.bind("<Control-g>", find_next)
+root.bind("<Control-G>", find_prev)
+root.bind("<Control-Shift-g>", find_prev)
+root.bind("<Control-Shift-G>", find_prev)
+root.bind("<F1>", show_help)
 category.bind("<<ComboboxSelected>>", on_category_select)
 content_canvas.bind("<Enter>", bind_mousewheel)
 content_canvas.bind("<Leave>", unbind_mousewheel)
@@ -1188,7 +1877,7 @@ material_list.bind("<<ListboxSelect>>", on_material_select)
 
 populate_categories(base_dir)
 if not category.get():
-    set_preview_image_counts(1, 1)
+    update_canvas_display([], [])
 
 load_debug_config(root, base_dir)
 
